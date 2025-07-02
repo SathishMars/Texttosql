@@ -74,25 +74,30 @@ class TextToSQLChain:
                 # Note: max_tokens not supported in this version
             )
             
-            # Create prompt template
+            # Create prompt template with better context
             prompt_template = """You are an expert SQL Server query generator. Convert the natural language question into a SQL Server T-SQL query.
 
-Database Schema:
+Database Schema and Sample Data:
 {schema}
 
-SQL Server T-SQL Rules:
+IMPORTANT GUIDELINES:
 1. Use SQL Server T-SQL syntax (not SQLite, MySQL, or PostgreSQL)
 2. Use square brackets around table and column names: [schema].[table_name]
 3. Use TOP N instead of LIMIT for row limits
-4. Use appropriate SQL Server data types and functions
-5. For date operations, use SQL Server date functions like GETDATE(), DATEADD(), DATEDIFF()
-6. Always specify schema names when referencing tables
-7. Use proper T-SQL syntax for JOINs, CTEs, and window functions
-8. Generate clean, efficient T-SQL queries
-9. Return only the SQL query, nothing else
+4. Always specify schema names when referencing tables
+5. When user asks general questions like "show me data" or "what's in the database", query actual data tables (not metadata tables)
+6. For exploration queries, use TOP 100 to limit results
+7. Look for tables with actual business data, not just metadata tables
+8. If searching for specific values, try LIKE '%value%' for partial matches
+9. Generate queries that are likely to return actual data
 
 Current database: {database}
 Server: {server}
+
+Examples of good queries for data exploration:
+- SELECT TOP 100 * FROM [dbo].[largest_table_name]
+- SELECT COUNT(*) as RecordCount, 'table_name' as TableName FROM [schema].[table_name]
+- SELECT DISTINCT [column_name] FROM [schema].[table_name] WHERE [column_name] IS NOT NULL
 
 Human Question: {question}
 
@@ -136,7 +141,7 @@ SQL Server T-SQL Query:"""
             return f"Error generating SQL: {str(e)}"
 
 class DatabaseManager:
-    """SQL Server database manager"""
+    """SQL Server database manager using Windows Authentication"""
     
     def __init__(self, server: str, database: str):
         self.server = server
@@ -144,21 +149,56 @@ class DatabaseManager:
         self.connection = None
     
     def connect(self):
-        """Connect to SQL Server"""
+        """Connect to SQL Server using Windows Authentication"""
         try:
             connection_string = (
                 f"DRIVER={{ODBC Driver 17 for SQL Server}};"
                 f"SERVER={self.server};"
                 f"DATABASE={self.database};"
                 f"Trusted_Connection=yes;"
+                f"Connection Timeout=30;"
+                f"Command Timeout=30;"
             )
-            self.connection = pyodbc.connect(connection_string)
-            return True, "Connected successfully"
+            
+            self.connection = pyodbc.connect(connection_string, timeout=30)
+            return True, "Connected successfully using Windows Authentication"
+            
         except Exception as e:
-            return False, str(e)
-    
-    def get_schema(self):
-        """Get database schema information"""
+            error_message = f"Windows Authentication failed: {str(e)}"
+            return False, error_message
+
+    def get_table_info_with_data(self):
+        """Get enhanced table information including row counts and sample data"""
+        if not self.connection:
+            success, message = self.connect()
+            if not success:
+                return f"Connection failed: {message}"
+        
+        try:
+            cursor = self.connection.cursor()
+            
+            # Get all tables with row counts
+            cursor.execute("""
+                SELECT 
+                    s.name AS schema_name,
+                    t.name AS table_name,
+                    p.rows AS row_count
+                FROM sys.tables t
+                INNER JOIN sys.schemas s ON t.schema_id = s.schema_id
+                INNER JOIN sys.partitions p ON t.object_id = p.object_id
+                WHERE p.index_id IN (0,1)
+                    AND s.name NOT IN ('sys', 'information_schema')
+                ORDER BY p.rows DESC
+            """)
+            
+            tables_with_counts = cursor.fetchall()
+            return tables_with_counts
+            
+        except Exception as e:
+            return f"Error getting table info: {str(e)}"
+
+    def get_enhanced_schema(self):
+        """Get enhanced database schema with row counts and sample data"""
         if not self.connection:
             success, message = self.connect()
             if not success:
@@ -169,26 +209,25 @@ class DatabaseManager:
             
             schema_info = [f"Database: {self.database} on Server: {self.server}\n"]
             
-            # Get tables and columns
-            cursor.execute("""
-                SELECT 
-                    TABLE_SCHEMA,
-                    TABLE_NAME
-                FROM INFORMATION_SCHEMA.TABLES 
-                WHERE TABLE_TYPE = 'BASE TABLE'
-                    AND TABLE_SCHEMA NOT IN ('sys', 'information_schema')
-                ORDER BY TABLE_SCHEMA, TABLE_NAME
-            """)
+            # Get SQL Server version
+            cursor.execute("SELECT @@VERSION")
+            version = cursor.fetchone()[0]
+            schema_info.append(f"SQL Server Version: {version[:50]}...\n")
             
-            tables = cursor.fetchall()
+            # Get tables with row counts
+            tables_with_counts = self.get_table_info_with_data()
+            if isinstance(tables_with_counts, str):
+                return tables_with_counts
             
-            for table in tables[:]:  # Limit to first 15 tables
-                schema_name, table_name = table
-                schema_info.append(f"\nTable: {schema_name}.{table_name}")
+            schema_info.append(f"Found {len(tables_with_counts)} tables with data:\n")
+            
+            # Show top 10 tables by row count with sample data
+            for i, (schema_name, table_name, row_count) in enumerate(tables_with_counts[:10]):
+                schema_info.append(f"\n{i+1}. Table: [{schema_name}].[{table_name}] ({row_count:,} rows)")
                 
-                # Get columns for this table
+                # Get column info
                 cursor.execute("""
-                    SELECT TOP 10
+                    SELECT TOP 5
                         COLUMN_NAME,
                         DATA_TYPE,
                         IS_NULLABLE
@@ -198,15 +237,77 @@ class DatabaseManager:
                 """, schema_name, table_name)
                 
                 columns = cursor.fetchall()
+                schema_info.append("   Columns:")
                 for column in columns:
                     col_name, data_type, is_nullable = column
                     nullable = "NULL" if is_nullable == "YES" else "NOT NULL"
-                    schema_info.append(f"    - {col_name}: {data_type} {nullable}")
+                    schema_info.append(f"     - [{col_name}]: {data_type} {nullable}")
+                
+                # Get sample data if table has data
+                if row_count > 0:
+                    try:
+                        sample_query = f"SELECT TOP 3 * FROM [{schema_name}].[{table_name}]"
+                        cursor.execute(sample_query)
+                        sample_rows = cursor.fetchall()
+                        if sample_rows:
+                            schema_info.append(f"   Sample data (first 3 rows):")
+                            for j, row in enumerate(sample_rows):
+                                row_data = [str(val)[:50] + "..." if val and len(str(val)) > 50 else str(val) for val in row]
+                                schema_info.append(f"     Row {j+1}: {row_data}")
+                    except Exception:
+                        schema_info.append("   (Sample data unavailable)")
             
             return '\n'.join(schema_info)
             
         except Exception as e:
-            return f"Error getting schema: {str(e)}"
+            return f"Error getting enhanced schema: {str(e)}"
+
+    def get_quick_data_overview(self):
+        """Get a quick overview of data in the database"""
+        if not self.connection:
+            success, message = self.connect()
+            if not success:
+                return {"success": False, "error": f"Connection failed: {message}"}
+        
+        try:
+            cursor = self.connection.cursor()
+            
+            # Get table counts
+            cursor.execute("""
+                SELECT 
+                    s.name AS schema_name,
+                    t.name AS table_name,
+                    p.rows AS row_count
+                FROM sys.tables t
+                INNER JOIN sys.schemas s ON t.schema_id = s.schema_id
+                INNER JOIN sys.partitions p ON t.object_id = p.object_id
+                WHERE p.index_id IN (0,1)
+                    AND s.name NOT IN ('sys', 'information_schema')
+                    AND p.rows > 0
+                ORDER BY p.rows DESC
+            """)
+            
+            results = cursor.fetchall()
+            
+            if results:
+                data = []
+                for schema_name, table_name, row_count in results:
+                    data.append({
+                        'Schema': schema_name,
+                        'Table': table_name,
+                        'Row Count': f"{row_count:,}"
+                    })
+                
+                return {
+                    "success": True,
+                    "data": data,
+                    "total_tables": len(results)
+                }
+            else:
+                return {"success": True, "data": [], "total_tables": 0}
+                
+        except Exception as e:
+            return {"success": False, "error": str(e)}
     
     def execute_query(self, sql: str):
         """Execute SQL query"""
@@ -250,20 +351,10 @@ def main():
     with st.sidebar:
         st.header("⚙️ Configuration")
         
-        # Version info
-        st.subheader("📦 Package Versions")
-        try:
-            import langchain
-            import langchain_groq
-            st.code(f"langchain: {langchain.__version__}")
-            st.code(f"langchain-groq: {langchain_groq.__version__}")
-            
-            # Show parameter info for this version
-            if hasattr(langchain_groq, '__version__') and langchain_groq.__version__.startswith('0.1.3'):
-                st.success("✅ Optimized for langchain-groq v0.1.3")
-                st.info("Using: groq_api_key + model_name parameters")
-        except:
-            st.warning("Cannot display version info")
+        # Connection method info
+        st.subheader("🔐 Database Connection")
+        st.success("✅ Using Windows Authentication")
+        st.info("This method has been verified to work with your server")
         
         # API Key
         st.subheader("🔑 Groq API Key")
@@ -300,26 +391,15 @@ def main():
             index=0
         )
         
-        # Connection info
-        st.subheader("🔗 Connection Info")
-        st.info(f"**Server:** UKSALD-MARS01\n**Database:** {selected_db}\n**Auth:** Windows Authentication")
-        
-        # Model info
-        st.subheader("🧠 AI Model")
-        st.info("**Model:** Llama 3.1 70B Versatile\n**Provider:** Groq\n**Framework:** LangChain\n**Client:** ChatGroq v0.1.3")
-        
         # Test connection
         if st.button("🔌 Test Connection"):
-            if api_key:
-                with st.spinner("Testing connection..."):
-                    db = DatabaseManager("UKSALD-MARS01", selected_db)
-                    success, message = db.connect()
-                    if success:
-                        st.success(f"✅ {message}")
-                    else:
-                        st.error(f"❌ {message}")
-            else:
-                st.warning("⚠️ Please provide API key first")
+            with st.spinner("Testing Windows Authentication connection..."):
+                db = DatabaseManager("UKSALD-MARS01", selected_db)
+                success, message = db.connect()
+                if success:
+                    st.success(f"✅ {message}")
+                else:
+                    st.error(f"❌ {message}")
     
     # Main content
     if not api_key:
@@ -335,7 +415,6 @@ def main():
             text_to_sql = TextToSQLChain(api_key)
             if text_to_sql.chain:
                 st.success("✅ LangChain with ChatGroq v0.1.3 initialized successfully!")
-                st.info("Using groq_api_key + model_name parameters for v0.1.3")
             else:
                 st.error("❌ Failed to initialize LangChain")
                 return
@@ -345,20 +424,68 @@ def main():
     
     db_manager = DatabaseManager("UKSALD-MARS01", selected_db)
     
-    # Database schema viewer
-    with st.expander("📊 View Database Schema", expanded=False):
-        if st.button("🔄 Load Schema"):
-            with st.spinner("Loading schema..."):
-                schema = db_manager.get_schema()
-                st.text(schema)
+    # Data exploration section
+    st.header("📊 Database Exploration")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        if st.button("🔍 Quick Data Overview"):
+            with st.spinner("Getting data overview..."):
+                overview = db_manager.get_quick_data_overview()
+                if overview['success']:
+                    if overview['data']:
+                        st.subheader(f"📈 Tables with Data ({overview['total_tables']} total)")
+                        df = pd.DataFrame(overview['data'])
+                        st.dataframe(df, use_container_width=True)
+                        
+                        # Suggest some queries
+                        st.subheader("💡 Suggested Questions:")
+                        largest_table = overview['data'][0]['Table'] if overview['data'] else 'table_name'
+                        st.write(f"• Show me data from {largest_table}")
+                        st.write(f"• What are the columns in {largest_table}?")
+                        st.write("• Show me the first 10 rows from the largest table")
+                        st.write("• How many records are in each table?")
+                    else:
+                        st.warning("No tables with data found")
+                else:
+                    st.error(f"Error: {overview['error']}")
+    
+    with col2:
+        if st.button("📋 Detailed Schema"):
+            with st.spinner("Loading enhanced schema..."):
+                schema = db_manager.get_enhanced_schema()
+                with st.expander("📊 Database Schema with Sample Data", expanded=True):
+                    st.text(schema)
     
     # Query input
-    st.subheader("🔍 Ask Your Question")
-    user_question = st.text_area(
-        "Enter your question in natural language:",
-        height=100,
-        placeholder="e.g., Show me all tables in the current database"
-    )
+    st.header("🔍 Ask Your Question")
+    
+    # Pre-filled example questions
+    example_questions = [
+        "Show me the first 10 rows from the largest table",
+        "What tables have the most data?",
+        "Show me a sample of data from any table",
+        "How many records are in each table?",
+        "What are the column names in the biggest table?"
+    ]
+    
+    selected_example = st.selectbox("Choose an example question:", ["Custom question..."] + example_questions)
+    
+    if selected_example == "Custom question...":
+        user_question = st.text_area(
+            "Enter your question in natural language:",
+            height=100,
+            placeholder="e.g., Show me data from the largest table"
+        )
+    else:
+        user_question = selected_example
+        st.text_area(
+            "Selected question:",
+            value=selected_example,
+            height=100,
+            disabled=True
+        )
     
     # Action buttons
     col1, col2 = st.columns(2)
@@ -374,12 +501,12 @@ def main():
             st.warning("⚠️ Please enter a question first.")
             return
         
-        # Get schema for context
-        with st.spinner("Getting database schema..."):
-            schema = db_manager.get_schema()
+        # Get enhanced schema for context
+        with st.spinner("Getting database schema with sample data..."):
+            schema = db_manager.get_enhanced_schema()
         
         # Generate SQL using LangChain with ChatGroq
-        with st.spinner("🧠 Generating SQL query with ChatGroq v0.1.3..."):
+        with st.spinner("🧠 Generating SQL query with enhanced context..."):
             sql_query = text_to_sql.generate_sql(
                 question=user_question,
                 schema=schema,
@@ -387,7 +514,7 @@ def main():
                 server="UKSALD-MARS01"
             )
         
-        st.subheader("📄 Generated SQL Query")
+        st.header("📄 Generated SQL Query")
         
         if sql_query.startswith("Error"):
             st.error(f"❌ {sql_query}")
@@ -400,7 +527,7 @@ def main():
             with st.spinner("⚡ Executing query..."):
                 result = db_manager.execute_query(sql_query)
             
-            st.subheader("📊 Query Results")
+            st.header("📊 Query Results")
             
             if result['success']:
                 if 'columns' in result and result['row_count'] > 0:
@@ -414,7 +541,7 @@ def main():
                     with col2:
                         st.metric("📋 Columns", len(result['columns']))
                     with col3:
-                        st.metric("🔗 Framework", "ChatGroq v0.1.3")
+                        st.metric("🔗 Authentication", "Windows Auth")
                     
                     # Display data
                     st.dataframe(df, use_container_width=True)
@@ -430,6 +557,10 @@ def main():
                     
                 elif 'columns' in result and result['row_count'] == 0:
                     st.info("✅ Query executed successfully, but no results found.")
+                    st.warning("💡 Try these suggestions:")
+                    st.write("• Use broader search terms (remove specific filters)")
+                    st.write("• Try 'Show me data from the largest table'")
+                    st.write("• Check the 'Quick Data Overview' to see available data")
                 else:
                     st.success(f"✅ {result.get('message', 'Query executed successfully')}")
             else:
@@ -437,7 +568,7 @@ def main():
     
     # Footer
     st.markdown("---")
-    st.markdown("🤖 Powered by LangChain & ChatGroq v0.1.3 | 🛠️ Built with Streamlit | 🗄️ SQL Server Integration")
+    st.markdown("🤖 Powered by LangChain & ChatGroq v0.1.3 | 🛠️ Built with Streamlit | 🗄️ SQL Server (Windows Auth)")
 
 if __name__ == "__main__":
     main()
